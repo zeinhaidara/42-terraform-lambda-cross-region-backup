@@ -1,7 +1,8 @@
 """Copy the latest snapshot of each tagged EBS volume to another region, encrypted.
 
 Runs in the source region on a schedule. Idempotent: a snapshot that already
-has a copy (found by tag in the destination) is skipped.
+has a pending or completed copy (found by tag in the destination) is skipped.
+A copy in state "error" doesn't count: it is reported and the copy is retried.
 """
 
 from __future__ import annotations
@@ -16,6 +17,12 @@ log = logging.getLogger()
 log.setLevel(logging.INFO)
 
 MANAGED_BY = "cross-region-backup"
+# Copies in these states mean "already copied". Anything else (e.g. "error") doesn't.
+LIVE_COPY_STATES = {"pending", "completed"}
+
+
+class CopyErrors(RuntimeError):
+    """Raised after a run that saw copies in state error, so the invocation fails."""
 
 
 @dataclass(frozen=True)
@@ -59,6 +66,7 @@ class Summary:
     deferred: list[str] = field(default_factory=list)
     volumes_without_snapshot: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
+    errored_copies: list[dict] = field(default_factory=list)
 
 
 def _paged(call, key: str, **kwargs) -> list[dict]:
@@ -112,7 +120,21 @@ def run(src_ec2, dest_ec2, cfg: Config, now: datetime) -> Summary:
             OwnerIds=["self"],
             Filters=[{"Name": "tag:source-snapshot-id", "Values": [snap["SnapshotId"]]}],
         )
-        if existing:
+        for bad in (c for c in existing if c.get("State") == "error"):
+            log.warning(
+                "copy %s of %s is in state error: %s",
+                bad["SnapshotId"],
+                snap["SnapshotId"],
+                bad.get("StateMessage", ""),
+            )
+            out.errored_copies.append(
+                {
+                    "copy_id": bad["SnapshotId"],
+                    "source_snapshot_id": snap["SnapshotId"],
+                    "message": bad.get("StateMessage", ""),
+                }
+            )
+        if any(c.get("State") in LIVE_COPY_STATES for c in existing):
             out.skipped_already_copied.append(snap["SnapshotId"])
             continue
         if started >= cfg.max_copies_per_run:
@@ -157,7 +179,10 @@ def run(src_ec2, dest_ec2, cfg: Config, now: datetime) -> Summary:
 
 
 def _apply_retention(dest_ec2, cfg: Config, now: datetime) -> list[str]:
-    """Delete our own copies past retention, but always keep each volume's newest copy."""
+    """Delete our own copies past retention.
+
+    Always keeps each volume's newest completed copy, and never deletes a pending one.
+    """
     ours = _paged(
         dest_ec2.describe_snapshots,
         "Snapshots",
@@ -166,6 +191,8 @@ def _apply_retention(dest_ec2, cfg: Config, now: datetime) -> list[str]:
     )
     newest: dict[str, dict] = {}
     for s in ours:
+        if s.get("State") != "completed":
+            continue  # an errored copy must not be what protects a volume
         vol = {t["Key"]: t["Value"] for t in s.get("Tags", [])}.get("source-volume-id", "")
         if vol not in newest or s["StartTime"] > newest[vol]["StartTime"]:
             newest[vol] = s
@@ -174,7 +201,7 @@ def _apply_retention(dest_ec2, cfg: Config, now: datetime) -> list[str]:
 
     deleted = []
     for s in sorted(ours, key=lambda s: s["SnapshotId"]):
-        if s["SnapshotId"] in keep or s["StartTime"] >= cutoff:
+        if s["SnapshotId"] in keep or s.get("State") == "pending" or s["StartTime"] >= cutoff:
             continue
         if not cfg.dry_run:
             dest_ec2.delete_snapshot(SnapshotId=s["SnapshotId"])
@@ -191,4 +218,8 @@ def handler(event, context, src_ec2=None, dest_ec2=None, now=None):
         dest_ec2 = dest_ec2 or boto3.client("ec2", region_name=cfg.dest_region)
     summary = run(src_ec2, dest_ec2, cfg, now or datetime.now(UTC))
     log.info(json.dumps(summary.__dict__))
+    if summary.errored_copies:
+        # All work is done by now; failing the invocation is what makes an alarm fire.
+        ids = ", ".join(e["copy_id"] for e in summary.errored_copies)
+        raise CopyErrors(f"{len(summary.errored_copies)} copy(ies) in state error: {ids}")
     return summary.__dict__
