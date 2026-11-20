@@ -14,3 +14,8 @@ __pycache__/
 *.egg-info/
 package/
 *.zip
+
+# Lambda zip built by archive_file
+.build/
+# Lock file is committed only for example roots
+/.terraform.lock.hcl
