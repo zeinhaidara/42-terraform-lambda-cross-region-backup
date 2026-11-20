@@ -6,9 +6,9 @@ with a KMS key that lives in that destination region. Old copies are pruned
 by a retention rule, and the function is **dry-run by default**.
 
 > **Status:** AWS EBS only. **Azure managed disks are not implemented.**
-> The Lambda logic is covered by 14 pytest tests with fake EC2 clients
-> (pagination, idempotency, copy cap and AWS copy-limit handling, retention,
-> dry run). The Terraform module is covered by 6 `terraform test` runs
+> The Lambda logic is covered by 20 pytest tests with fake EC2 clients
+> (pagination, idempotency, errored and pending copies, copy cap and AWS
+> copy-limit handling, retention, dry run). The Terraform module is covered by 6 `terraform test` runs
 > against mocked providers, including four rejected inputs. The example root
 > passes `terraform validate`. **Nothing has been planned or applied in
 > AWS**, and the function has never run against real snapshots.
@@ -43,17 +43,26 @@ Each run:
    following `NextToken`.
 2. Finds the latest **completed** snapshot of each. Creating the snapshots is
    out of scope; use Data Lifecycle Manager or AWS Backup for that.
-3. Skips any snapshot that already has a copy in the destination (looked up
-   by the `source-snapshot-id` tag). That makes re-runs **idempotent**.
+3. Skips any snapshot that already has a **pending or completed** copy in
+   the destination (looked up by the `source-snapshot-id` tag). A copy in
+   state `error` doesn't count: it is logged as a warning, listed under
+   `errored_copies` in the run summary, and the snapshot is copied again.
 4. Calls `CopySnapshot` on a destination-region client with `Encrypted=true`
    and the destination key, tagging the copy as it is created.
 5. Starts at most `max_copies_per_run` copies (default 5). If AWS answers
    `ResourceLimitExceeded`, the remaining snapshots are reported as
    `deferred` and picked up next run; any other error fails the run.
 6. **Retention:** deletes copies tagged `managed-by=cross-region-backup`
-   that are older than `retention_days`, but **always keeps the newest copy
-   of each volume**, even if the volume is gone. Snapshots it didn't make are
+   that are older than `retention_days`, but **always keeps the newest
+   completed copy of each volume** (even if the volume is gone) and never
+   deletes a pending copy. An errored copy never counts as the one to keep. Snapshots it didn't make are
    never touched (the IAM policy enforces the same by tag).
+
+7. **Errored copies fail the invocation.** If any copy in state `error` was
+   seen, the function first finishes everything else (new copies, retries,
+   retention), logs the summary, and then raises `CopyErrors`. The Lambda
+   invocation is marked failed, so a CloudWatch alarm on the function's
+   `Errors` metric can page someone.
 
 With `dry_run = true` (the default) the function only reports what it would
 copy and delete.
@@ -149,6 +158,7 @@ root that passes providers in (`examples/basic`). CI also fails if
   as 20 at the time of writing; AWS behaviour to re-verify). The function
   caps its own starts per run and defers on `ResourceLimitExceeded`.
 - Copies only the latest snapshot per volume per run, not every snapshot.
+  Errored copies of older snapshots are therefore not detected.
 - Copies of large or first-time snapshots can take hours; the function
   starts them and does not wait.
 - Single account. Cross-account copies need key and snapshot sharing, not
@@ -168,6 +178,12 @@ root that passes providers in (`examples/basic`). CI also fails if
 
 ## Idempotency
 
-Re-running the function is safe: snapshots that already have a copy are
-skipped, and retention only removes copies past their age. Re-applying the
-Terraform with the same inputs is a no-op.
+Re-running the function is safe: a snapshot whose copy is pending or
+completed is skipped, so a copy still in progress from an earlier run is not
+started twice. A copy in state `error` is the one exception: it doesn't count
+as done, so the run copies the snapshot again. Errored copies are found while
+checking each volume's **latest** snapshot, and every run that finds one fails
+its invocation, even after the retry succeeded, until someone deletes the
+errored copy or it ages out under retention. That is deliberate: an alarm
+keeps firing until a person has looked. Retention only removes copies past
+their age. Re-applying the Terraform with the same inputs is a no-op.
