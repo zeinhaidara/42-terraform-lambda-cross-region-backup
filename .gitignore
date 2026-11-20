@@ -1,0 +1,16 @@
+memory/
+.env
+.vscode/
+.idea/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+package/
+*.zip
