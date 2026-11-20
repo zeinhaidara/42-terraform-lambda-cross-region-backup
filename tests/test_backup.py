@@ -4,7 +4,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 import backup
-from backup import MANAGED_BY, Config, run
+from backup import MANAGED_BY, Config, CopyErrors, run
 
 NOW = datetime(2026, 11, 20, 3, 0, tzinfo=UTC)
 KEY = "arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555"
@@ -65,7 +65,17 @@ class FakeDestEC2:
                 {"Error": {"Code": "ResourceLimitExceeded", "Message": "max"}}, "CopySnapshot"
             )
         self.copies.append(kw)
-        return {"SnapshotId": f"snap-copy{len(self.copies)}"}
+        new_id = f"snap-copy{len(self.copies)}"
+        # Like EC2: the copy exists straight away, in state pending, with its tags.
+        self.snapshots.append(
+            {
+                "SnapshotId": new_id,
+                "State": "pending",
+                "StartTime": NOW,
+                "Tags": kw["TagSpecifications"][0]["Tags"],
+            }
+        )
+        return {"SnapshotId": new_id}
 
     def delete_snapshot(self, SnapshotId):
         self.deleted.append(SnapshotId)
@@ -84,9 +94,11 @@ def snap(sid, vid, age_hours, state="completed"):
     }
 
 
-def copy_of(sid, vid, age_days):
+def copy_of(sid, vid, age_days, state="completed"):
     return {
-        "SnapshotId": f"copy-{sid}",
+        "SnapshotId": f"copy-{sid}" if state == "completed" else f"copy-{sid}-{state}",
+        "State": state,
+        "StateMessage": "copy failed: internal error" if state == "error" else "",
         "StartTime": NOW - timedelta(days=age_days),
         "Tags": [
             {"Key": "managed-by", "Value": MANAGED_BY},
@@ -228,3 +240,80 @@ def test_dry_run_is_the_default(monkeypatch):
     result = backup.handler({}, None, src_ec2=source(), dest_ec2=dest, now=NOW)
     assert result["dry_run"] is True
     assert dest.copies == []
+
+
+# --- copies in state error ------------------------------------------------------
+
+
+def test_errored_copy_does_not_block_a_retry():
+    dest = FakeDestEC2(
+        existing=[copy_of("snap-a-new", "vol-a", 0, state="error"), copy_of("snap-b", "vol-b", 0)]
+    )
+    out = run(source(), dest, cfg(), NOW)
+    assert [c["SourceSnapshotId"] for c in dest.copies] == ["snap-a-new"]
+    assert out.skipped_already_copied == ["snap-b"]
+    assert out.errored_copies == [
+        {
+            "copy_id": "copy-snap-a-new-error",
+            "source_snapshot_id": "snap-a-new",
+            "message": "copy failed: internal error",
+        }
+    ]
+
+
+def test_pending_copy_is_not_duplicated():
+    dest = FakeDestEC2(
+        existing=[
+            copy_of("snap-a-new", "vol-a", 0, state="pending"),
+            copy_of("snap-b", "vol-b", 0, state="pending"),
+        ]
+    )
+    out = run(source(), dest, cfg(), NOW)
+    assert dest.copies == []
+    assert out.skipped_already_copied == ["snap-a-new", "snap-b"]
+
+
+def test_copies_started_by_one_run_are_not_repeated_by_the_next():
+    dest = FakeDestEC2()
+    run(source(), dest, cfg(), NOW)
+    assert len(dest.copies) == 2
+    second = run(source(), dest, cfg(), NOW)  # both copies are still pending
+    assert len(dest.copies) == 2
+    assert second.skipped_already_copied == ["snap-a-new", "snap-b"]
+
+
+def test_invocation_fails_after_finishing_when_a_copy_errored(monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "eu-west-2")
+    monkeypatch.setenv("DEST_REGION", "us-east-1")
+    monkeypatch.setenv("DEST_KMS_KEY_ARN", KEY)
+    monkeypatch.setenv("DRY_RUN", "false")
+    dest = FakeDestEC2(
+        existing=[
+            copy_of("snap-a-new", "vol-a", 0, state="error"),
+            copy_of("snap-a-old", "vol-a", 40),
+        ]
+    )
+    with pytest.raises(CopyErrors, match="copy-snap-a-new-error"):
+        backup.handler({}, None, src_ec2=source(), dest_ec2=dest, now=NOW)
+    # The rest of the run still happened before the failure.
+    assert [c["SourceSnapshotId"] for c in dest.copies] == ["snap-a-new", "snap-b"]
+
+
+def test_clean_run_does_not_fail(monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "eu-west-2")
+    monkeypatch.setenv("DEST_REGION", "us-east-1")
+    monkeypatch.setenv("DEST_KMS_KEY_ARN", KEY)
+    monkeypatch.setenv("DRY_RUN", "false")
+    result = backup.handler({}, None, src_ec2=source(), dest_ec2=FakeDestEC2(), now=NOW)
+    assert result["errored_copies"] == []
+
+
+def test_retention_ignores_errored_and_pending_when_choosing_what_to_keep():
+    old_good = copy_of("snap-a-0", "vol-a", 30)
+    newer_bad = copy_of("snap-a-1", "vol-a", 1, state="error")
+    old_pending = copy_of("snap-b-0", "vol-b", 40, state="pending")
+    dest = FakeDestEC2(existing=[old_good, newer_bad, old_pending])
+    out = run(source(), dest, cfg(retention_days=14), NOW)
+    # The only completed copy of vol-a is kept even though it is old.
+    assert old_good["SnapshotId"] not in out.deleted
+    assert old_pending["SnapshotId"] not in out.deleted
