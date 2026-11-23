@@ -19,6 +19,11 @@ by a retention rule, and the function is **dry-run by default**.
 > EBS volumes / managed disks to a secondary region on a schedule with
 > encryption.
 
+Why it matters: snapshots that only exist in the volume's own region don't
+help if that region has an outage. A scheduled, encrypted copy in a second
+region, with old copies pruned, keeps a recovery point there without anyone
+having to remember to make it.
+
 ## How it works
 
 ```mermaid
